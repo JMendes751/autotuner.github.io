@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Robô de Afinação de Guitarra — Código ESP32</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      max-width: 1100px; margin: 0 auto; padding: 24px;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      line-height: 1.55;
+    }
+    h1 { line-height: 1.2; }
+    .note { padding: 12px 16px; border-left: 4px solid #888; background: rgba(127,127,127,.12); }
+    pre {
+      overflow: auto; padding: 18px; border-radius: 10px;
+      background: #15191f; color: #e7edf5; font-size: 13px;
+      line-height: 1.5; tab-size: 2;
+    }
+    code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    button {
+      padding: 10px 16px; border: 0; border-radius: 8px;
+      cursor: pointer; font: inherit; margin: 8px 8px 8px 0;
+    }
+    @media print {
+      button { display: none; }
+      body { max-width: none; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Robô de afinação automática de guitarra — ESP32</h1>
+  <p>Este ficheiro contém o código C++ para o Arduino IDE, destinado a um protótipo de afinador automático de guitarra de seis cordas.</p>
+  <div class="note">
+    <strong>Nota de segurança:</strong> o código é uma base de protótipo e precisa de calibração antes de ser ligado a uma guitarra real. Confirma o sentido do motor, limita o binário e a tensão das cordas, e testa primeiro sem a guitarra. O algoritmo de deteção de pitch é inicial e pode precisar de melhorias para afinar com precisão.
+  </div>
+  <p>Instala a biblioteca <code>AccelStepper</code> no Arduino IDE. O código usa a porta série a 115200 baud.</p>
+  <button onclick="downloadSketch()">Descarregar código .ino</button>
+  <button onclick="window.print()">Imprimir / Guardar como PDF</button>
+  <h2>Código</h2>
+  <pre><code id="sketch"></code></pre>
+
+<script id="sketch-source" type="text/plain">
+#include <Arduino.h>
+#include <AccelStepper.h>
+#include <math.h>
+
+// =====================================================
+// CONFIGURACAO DO HARDWARE
+// =====================================================
+
+const int MIC_PIN = 34;       // Saida analogica do sensor de som
+const int STEP_PIN = 26;      // STEP do driver A4988
+const int DIR_PIN = 27;       // DIR do driver A4988
+const int ENABLE_PIN = 25;    // ENABLE do driver (opcional)
+
+const int SAMPLE_RATE = 8000;
+const int NUM_SAMPLES = 2048;
+
+const float A4_REFERENCE = 440.0f;
+const float TOLERANCE_CENTS = 3.0f;
+
+// Ajustar depois de testar o mecanismo.
+// Poucos passos por ciclo ajudam a evitar excesso de tensao.
+const int STEPS_PER_ADJUSTMENT = 2;
+const int MAX_ADJUSTMENTS = 80;
+
+// true se DIR HIGH fizer subir o tom.
+// Se o comportamento for inverso, alterar para false.
+const bool DIR_RAISES_PITCH = true;
+
+// Motor de passos em modo DRIVER (STEP/DIR)
+AccelStepper motor(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+// =====================================================
+// BIBLIOTECA DE NOTAS
+// =====================================================
+
+// MIDI: C4 = 60, A4 = 69
+// A4 = 440 Hz, temperamento igual
+
+struct Note {
+  const char* name;
+  int midi;
+};
+
+Note guitarNotes[] = {
+  {"E2", 40}, {"F2", 41}, {"F#2", 42},
+  {"G2", 43}, {"G#2", 44}, {"A2", 45},
+  {"A#2", 46}, {"B2", 47}, {"C3", 48},
+  {"C#3", 49}, {"D3", 50}, {"D#3", 51},
+  {"E3", 52}, {"F3", 53}, {"F#3", 54},
+  {"G3", 55}, {"G#3", 56}, {"A3", 57},
+  {"A#3", 58}, {"B3", 59}, {"C4", 60},
+  {"C#4", 61}, {"D4", 62}, {"D#4", 63},
+  {"E4", 64}, {"F4", 65}, {"F#4", 66},
+  {"G4", 67}, {"G#4", 68}, {"A4", 69},
+  {"A#4", 70}, {"B4", 71}, {"C5", 72},
+  {"C#5", 73}, {"D5", 74}, {"D#5", 75},
+  {"E5", 76}, {"F5", 77}, {"F#5", 78},
+  {"G5", 79}, {"G#5", 80}, {"A5", 81}
+};
+
+const int NOTE_COUNT = sizeof(guitarNotes) / sizeof(guitarNotes[0]);
+
+float midiToFrequency(int midi) {
+  return A4_REFERENCE * powf(2.0f, (midi - 69) / 12.0f);
+}
+
+// =====================================================
+// BIBLIOTECA DE AFINACOES
+// Ordem: 6.ª corda -> 1.ª corda
+// =====================================================
+
+struct Tuning {
+  const char* name;
+  int midi[6];
+};
+
+Tuning tunings[] = {
+  {"Standard",   {40, 45, 50, 55, 59, 64}}, // E A D G B E
+  {"Drop D",     {38, 45, 50, 55, 59, 64}}, // D A D G B E
+  {"Eb Standard",{39, 44, 49, 54, 58, 63}}, // Eb Ab Db Gb Bb Eb
+  {"D Standard", {38, 43, 48, 53, 57, 62}}, // D G C F A D
+  {"Open G",     {38, 43, 50, 55, 59, 62}}, // D G D G B D
+  {"DADGAD",     {38, 45, 50, 55, 57, 62}}  // D A D G A D
+};
+
+const int TUNING_COUNT = sizeof(tunings) / sizeof(tunings[0]);
+
+int selectedTuning = 0;
+int selectedString = 0; // 0 = 6.ª corda, E2 em Standard
+
+// =====================================================
+// CAPTURA E DETECAO DE PITCH
+// =====================================================
+
+int16_t samples[NUM_SAMPLES];
+
+bool captureAudio() {
+  const uint32_t intervalUs = 1000000UL / SAMPLE_RATE;
+  uint32_t nextSample = micros();
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    while ((int32_t)(micros() - nextSample) < 0) {
+      // Esperar pelo instante da amostra
+    }
+
+    samples[i] = analogRead(MIC_PIN);
+    nextSample += intervalUs;
+  }
+
+  return true;
+}
+
+// Estima a frequencia fundamental por autocorrelacao.
+// E uma implementacao inicial: ruido e harmonicos podem
+// provocar leituras erradas, pelo que requer calibracao.
+
+float detectPitch() {
+  captureAudio();
+
+  // Remover componente DC
+  float mean = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    mean += samples[i];
+  }
+  mean /= NUM_SAMPLES;
+
+  float energy = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    float v = samples[i] - mean;
+    energy += v * v;
+  }
+
+  if (energy < 100000.0f) {
+    return 0.0f; // Sinal demasiado fraco
+  }
+
+  const int minLag = SAMPLE_RATE / 400; // 400 Hz
+  const int maxLag = SAMPLE_RATE / 65;  // 65 Hz
+
+  float bestCorrelation = -1.0f;
+  int bestLag = 0;
+
+  for (int lag = minLag; lag <= maxLag; lag++) {
+    float correlation = 0;
+    float energyA = 0;
+    float energyB = 0;
+
+    for (int i = 0; i < NUM_SAMPLES - lag; i++) {
+      float a = samples[i] - mean;
+      float b = samples[i + lag] - mean;
+
+      correlation += a * b;
+      energyA += a * a;
+      energyB += b * b;
+    }
+
+    float denominator = sqrtf(energyA * energyB);
+    if (denominator <= 0) continue;
+
+    correlation /= denominator;
+
+    if (correlation > bestCorrelation) {
+      bestCorrelation = correlation;
+      bestLag = lag;
+    }
+  }
+
+  if (bestLag == 0 || bestCorrelation < 0.60f) {
+    return 0.0f;
+  }
+
+  return (float)SAMPLE_RATE / bestLag;
+}
+
+float centsDifference(float measured, float target) {
+  if (measured <= 0 || target <= 0) return 0;
+  return 1200.0f * log2f(measured / target);
+}
+
+// =====================================================
+// CONTROLO DO MOTOR
+// =====================================================
+
+void moveMotor(int steps, bool raisePitch) {
+  if (steps <= 0) return;
+
+  bool directionHigh = raisePitch == DIR_RAISES_PITCH;
+  digitalWrite(DIR_PIN, directionHigh ? HIGH : LOW);
+
+  // Movimento incremental. O sentido depende da montagem.
+  motor.move(0); // Limpar movimento pendente
+
+  for (int i = 0; i < steps; i++) {
+    digitalWrite(STEP_PIN, HIGH);
+    delayMicroseconds(800);
+    digitalWrite(STEP_PIN, LOW);
+    delayMicroseconds(800);
+  }
+
+  // Dar tempo para a corda estabilizar
+  delay(250);
+}
+
+// =====================================================
+// AFINACAO AUTOMATICA
+// =====================================================
+
+void tuneSelectedString() {
+  const char* targetName = nullptr;
+
+  for (int i = 0; i < NOTE_COUNT; i++) {
+    if (guitarNotes[i].midi == tunings[selectedTuning].midi[selectedString]) {
+      targetName = guitarNotes[i].name;
+      break;
+    }
+  }
+
+  int targetMidi = tunings[selectedTuning].midi[selectedString];
+  float targetHz = midiToFrequency(targetMidi);
+
+  Serial.println("\\n--- AFINACAO AUTOMATICA ---");
+  Serial.printf("Afinacao: %s\\n", tunings[selectedTuning].name);
+  Serial.printf("Corda: %d | Nota-alvo: %s | %.2f Hz\\n",
+                6 - selectedString,
+                targetName ? targetName : "Desconhecida",
+                targetHz);
+
+  for (int attempt = 0; attempt < MAX_ADJUSTMENTS; attempt++) {
+    Serial.println("Toca a corda selecionada e deixa-a vibrar...");
+
+    float measuredHz = detectPitch();
+
+    if (measuredHz <= 0) {
+      Serial.println("Sinal insuficiente ou instavel. Tenta novamente.");
+      delay(300);
+      continue;
+    }
+
+    float cents = centsDifference(measuredHz, targetHz);
+
+    Serial.printf("Detetado: %.2f Hz | Erro: %.1f cents\\n",
+                  measuredHz, cents);
+
+    if (fabsf(cents) <= TOLERANCE_CENTS) {
+      Serial.println("Corda afinada.");
+      return;
+    }
+
+    // Evitar movimentos agressivos com erros muito grandes.
+    if (fabsf(cents) > 300.0f) {
+      Serial.println("Erro excessivo: verifica a corda e a selecao.");
+      Serial.println("Motor bloqueado por seguranca.");
+      return;
+    }
+
+    // Se a frequencia for baixa, aumentar tensao.
+    // Se for alta, reduzir tensao.
+    bool raisePitch = measuredHz < targetHz;
+
+    Serial.println(raisePitch ? "A subir o tom..." : "A descer o tom...");
+    moveMotor(STEPS_PER_ADJUSTMENT, raisePitch);
+
+    Serial.println("Volta a tocar a corda para nova medicao.");
+    delay(400);
+  }
+
+  Serial.println("Limite de ajustes atingido. Afinacao nao confirmada.");
+}
+
+// =====================================================
+// INTERFACE SERIAL
+// =====================================================
+
+void printTunings() {
+  Serial.println("\\nAfinacoes disponiveis:");
+
+  for (int i = 0; i < TUNING_COUNT; i++) {
+    Serial.printf("%d: %s\\n", i, tunings[i].name);
+  }
+}
+
+void printNotes() {
+  Serial.println("\\nNotas disponiveis:");
+
+  for (int i = 0; i < NOTE_COUNT; i++) {
+    Serial.printf("%s: %.2f Hz\\n",
+                  guitarNotes[i].name,
+                  midiToFrequency(guitarNotes[i].midi));
+  }
+}
+
+void printStrings() {
+  Serial.printf("\\nAfinacao atual: %s\\n", tunings[selectedTuning].name);
+
+  for (int i = 0; i < 6; i++) {
+    Serial.printf("%d.ª corda: %s (%.2f Hz)\\n",
+                  6 - i,
+                  "alvo",
+                  midiToFrequency(tunings[selectedTuning].midi[i]));
+  }
+}
+
+void printHelp() {
+  Serial.println("\\nComandos:");
+  Serial.println("t 0..5  - selecionar corda (0=6.ª, 5=1.ª)");
+  Serial.println("s 0..5  - selecionar afinacao");
+  Serial.println("a       - afinar a corda selecionada");
+  Serial.println("n       - listar notas e frequencias");
+  Serial.println("l       - listar afinacoes");
+  Serial.println("v       - ver notas-alvo das 6 cordas");
+  Serial.println("h       - ajuda");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(MIC_PIN, INPUT);
+  pinMode(STEP_PIN, OUTPUT);
+  pinMode(DIR_PIN, OUTPUT);
+  pinMode(ENABLE_PIN, OUTPUT);
+
+  // No A4988, ENABLE LOW ativa o driver.
+  digitalWrite(ENABLE_PIN, LOW);
+
+  analogReadResolution(12);
+  motor.setMaxSpeed(300);
+  motor.setAcceleration(100);
+
+  Serial.println("\\nROBO DE AFINACAO DE GUITARRA");
+  Serial.println("Referencia: A4 = 440 Hz");
+  printHelp();
+}
+
+void loop() {
+  if (!Serial.available()) return;
+
+  String command = Serial.readStringUntil('\\n');
+  command.trim();
+
+  if (command == "a") {
+    tuneSelectedString();
+  }
+  else if (command == "n") {
+    printNotes();
+  }
+  else if (command == "l") {
+    printTunings();
+  }
+  else if (command == "v") {
+    printStrings();
+  }
+  else if (command == "h") {
+    printHelp();
+  }
+  else if (command.startsWith("t ")) {
+    int value = command.substring(2).toInt();
+
+    if (value >= 0 && value <= 5) {
+      selectedString = value;
+      Serial.printf("Corda selecionada: %d.ª\\n", 6 - value);
+    } else {
+      Serial.println("Corda invalida. Usa t 0..5.");
+    }
+  }
+  else if (command.startsWith("s ")) {
+    int value = command.substring(2).toInt();
+
+    if (value >= 0 && value < TUNING_COUNT) {
+      selectedTuning = value;
+      Serial.printf("Afinacao selecionada: %s\\n",
+                    tunings[selectedTuning].name);
+      printStrings();
+    } else {
+      Serial.println("Afinacao invalida. Usa s 0..5.");
+    }
+  }
+  else {
+    Serial.println("Comando desconhecido. Escreve h para ajuda.");
+  }
+}
+</script>
+
+<script>
+  const source = document.getElementById('sketch-source').textContent.trim();
+  document.getElementById('sketch').textContent = source;
+
+  function downloadSketch() {
+    const blob = new Blob([source + '\\n'], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'robo_afinacao_guitarra.ino';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+</script>
+</body>
+</html>
